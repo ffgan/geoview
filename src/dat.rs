@@ -1,6 +1,3 @@
-use std::fs::File;
-use std::io::Read;
-
 use crate::proto::{self, field_bytes, field_str, field_varint};
 
 #[derive(Clone, Debug)]
@@ -34,13 +31,6 @@ pub fn open_error(path: &str, err: std::io::Error) -> String {
     } else {
         format!("open {path}: {err}")
     }
-}
-
-pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
-    let mut file = File::open(path).map_err(|err| open_error(path, err))?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).map_err(|err| err.to_string())?;
-    Ok(data)
 }
 
 pub fn is_protobuf(data: &[u8]) -> bool {

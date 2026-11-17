@@ -1,5 +1,6 @@
 mod dat;
 mod domainset;
+mod load;
 mod proto;
 mod srs;
 
@@ -7,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use dat::{Cidr, Domain, GeoIpEntry, GeoSiteEntry};
+use dat::{Domain, GeoIpEntry, GeoSiteEntry};
 use srs::Rules;
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.3.1";
 
 struct Flags {
     input: String,
@@ -208,7 +209,12 @@ Usage of {program}:
 }
 
 fn list_codes(flags: &Flags) -> Result<(), String> {
-    let data = dat::read_file(&flags.input).map_err(|_| "Can't open input file".to_string())?;
+    let mapped = match load::MappedFile::open(&flags.input) {
+        Ok(mapped) => mapped,
+        Err(err) if err.starts_with("open ") => return Err("Can't open input file".to_string()),
+        Err(err) => return Err(err),
+    };
+    let data = mapped.bytes();
     println!("Available codes:");
     if flags.datatype == "geosite" && data.first() == Some(&0) {
         if let Some(entries) = dat::sing_sites(&data) {
@@ -248,7 +254,8 @@ fn extract_geoip(flags: &Flags) -> Result<Vec<String>, String> {
 }
 
 fn selected_geoip(path: &str, list: &str) -> Result<Vec<GeoIpEntry>, String> {
-    let data = dat::read_file(path)?;
+    let mapped = load::MappedFile::open(path)?;
+    let data = mapped.bytes();
     let (all, wanted) = wanted_codes(list);
     let mut entries = Vec::new();
     for loc in dat::locate_v2(&data) {
@@ -282,7 +289,7 @@ fn extract_geosite(flags: &Flags) -> Result<Vec<String>, String> {
     let entries = selected_geosite(&flags.input, &flags.list).map_err(|err| format!("Extract failed: {err}"))?;
     let lines = geosite_rules(&entries, &flags.list, flags.regex, false, flags.strict)?;
     let mut values: Vec<String> = lines.into_iter().map(|item| item.value).collect();
-    values.sort();
+    values.sort_unstable();
     values.dedup();
     Ok(values)
 }
@@ -392,62 +399,103 @@ fn lookup(flags: &Flags) -> Result<Vec<String>, String> {
 }
 
 fn lookup_geoip(flags: &Flags) -> Result<Vec<String>, String> {
-    let data = dat::read_file(&flags.input)?;
     let Some(query) = parse_lookup_ip(&flags.value) else {
         return Ok(Vec::new());
     };
+    let mapped = load::MappedFile::open(&flags.input)?;
+    let data = mapped.bytes();
     let mut lines = Vec::new();
-    for loc in dat::locate_v2(&data) {
-        let entry = dat::parse_geoip(&data[loc.start..loc.end]);
-        if entry.cidrs.iter().any(|cidr| cidr_contains(cidr, query)) {
-            lines.push(entry.code);
+    for loc in dat::locate_v2(data) {
+        if geo_body_contains(&data[loc.start..loc.end], query) {
+            lines.push(loc.code);
         }
     }
     Ok(lines)
+}
+
+fn geo_body_contains(body: &[u8], query: std::net::IpAddr) -> bool {
+    let mut hit = false;
+    proto::visit(body, |field, value| {
+        if field == 2 {
+            if let proto::Borrowed::Bytes(message) = value {
+                if cidr_msg_contains(message, query) {
+                    hit = true;
+                    return proto::Control::Break;
+                }
+            }
+        }
+        proto::Control::Continue
+    });
+    hit
+}
+
+fn cidr_msg_contains(message: &[u8], query: std::net::IpAddr) -> bool {
+    let mut raw = [0u8; 16];
+    let mut raw_len = 0usize;
+    let mut prefix = 0u32;
+    proto::visit(message, |field, value| {
+        match (field, value) {
+            (1, proto::Borrowed::Bytes(bytes)) if bytes.len() <= 16 => {
+                raw[..bytes.len()].copy_from_slice(bytes);
+                raw_len = bytes.len();
+            }
+            (2, proto::Borrowed::Varint(bits)) => prefix = bits as u32,
+            _ => {}
+        }
+        proto::Control::Continue
+    });
+    ip_prefix_contains(&raw[..raw_len], prefix, query)
+}
+
+fn ip_prefix_contains(ip: &[u8], bits: u32, query: std::net::IpAddr) -> bool {
+    if let Some(network) = ipv4_network(ip) {
+        let std::net::IpAddr::V4(address) = query else {
+            return false;
+        };
+        if bits > 32 {
+            return false;
+        }
+        let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+        if network & mask != network {
+            return false;
+        }
+        return u32::from(address) & mask == network;
+    }
+    let std::net::IpAddr::V6(address) = query else {
+        return false;
+    };
+    if ip.len() != 16 || bits > 128 {
+        return false;
+    }
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(ip);
+    let network = u128::from(std::net::Ipv6Addr::from(raw));
+    let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+    if network & mask != network {
+        return false;
+    }
+    u128::from(address) & mask == network
+}
+
+fn ipv4_network(ip: &[u8]) -> Option<u32> {
+    match ip {
+        [a, b, c, d] => Some(u32::from_be_bytes([*a, *b, *c, *d])),
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d] => Some(u32::from_be_bytes([*a, *b, *c, *d])),
+        _ => None,
+    }
 }
 
 fn parse_lookup_ip(value: &str) -> Option<std::net::IpAddr> {
     value.trim().parse().ok()
 }
 
-fn cidr_contains(cidr: &Cidr, query: std::net::IpAddr) -> bool {
-    let text = dat::cidr_line(cidr);
-    let Some((addr, bits)) = text.split_once('/') else {
-        return false;
-    };
-    let Ok(bits) = bits.parse::<u32>() else {
-        return false;
-    };
-    let Ok(network) = addr.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    match (network, query) {
-        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(ip)) if bits <= 32 => {
-            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-            let network = u32::from(network);
-            if network & mask != network {
-                return false;
-            }
-            u32::from(ip) & mask == network
-        }
-        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(ip)) if bits <= 128 => {
-            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
-            let network = u128::from(network);
-            if network & mask != network {
-                return false;
-            }
-            u128::from(ip) & mask == network
-        }
-        _ => false,
-    }
-}
-
 fn lookup_geosite(flags: &Flags) -> Result<Vec<String>, String> {
-    let data = dat::read_file(&flags.input).map_err(|_| "Not a valid geosite format".to_string())?;
+    let mapped = load::MappedFile::open(&flags.input).map_err(|_| "Not a valid geosite format".to_string())?;
+    let data = mapped.bytes();
     let query = flags.value.trim().to_lowercase();
     let mut lines = Vec::new();
     if data.first() == Some(&0) {
-        if let Some(entries) = dat::sing_sites(&data) {
+        if let Some(entries) = dat::sing_sites(data) {
             if !entries.is_empty() {
                 for entry in &entries {
                     record_site_match(&mut lines, entry, &query);
@@ -456,11 +504,104 @@ fn lookup_geosite(flags: &Flags) -> Result<Vec<String>, String> {
             }
         }
     }
-    for loc in dat::locate_v2(&data) {
-        let entry = dat::parse_geosite(&data[loc.start..loc.end]);
-        record_site_match(&mut lines, &entry, &query);
+    let query_bytes = query.as_bytes();
+    for loc in dat::locate_v2(data) {
+        let Some(attrs) = site_hits(&data[loc.start..loc.end], query_bytes) else {
+            continue;
+        };
+        let code = loc.code.to_uppercase();
+        lines.push(code.clone());
+        for attr in attrs {
+            lines.push(format!("{code}@{attr}"));
+        }
     }
     Ok(lines)
+}
+
+fn site_hits(body: &[u8], query: &[u8]) -> Option<Vec<String>> {
+    let mut matched = false;
+    let mut attrs = Vec::new();
+    proto::visit(body, |field, value| {
+        if field == 2 {
+            if let proto::Borrowed::Bytes(message) = value {
+                if domain_message_matches(message, query) {
+                    matched = true;
+                    attrs.extend(attribute_keys(message));
+                }
+            }
+        }
+        proto::Control::Continue
+    });
+    if !matched {
+        return None;
+    }
+    attrs.sort_unstable();
+    attrs.dedup();
+    Some(attrs)
+}
+
+fn domain_message_matches(message: &[u8], query: &[u8]) -> bool {
+    let base = message.as_ptr() as usize;
+    let mut kind = 0u32;
+    let mut span: Option<(usize, usize)> = None;
+    proto::visit(message, |field, value| {
+        match (field, value) {
+            (1, proto::Borrowed::Varint(value)) => kind = value as u32,
+            (2, proto::Borrowed::Bytes(bytes)) => span = Some((bytes.as_ptr() as usize - base, bytes.len())),
+            _ => {}
+        }
+        proto::Control::Continue
+    });
+    let Some((offset, len)) = span else {
+        return false;
+    };
+    domain_bytes_match(kind, &message[offset..offset + len], query)
+}
+
+fn attribute_keys(message: &[u8]) -> Vec<String> {
+    let base = message.as_ptr() as usize;
+    let mut spans = Vec::new();
+    proto::visit(message, |field, value| {
+        if let (3, proto::Borrowed::Bytes(attribute)) = (field, value) {
+            proto::visit(attribute, |field, value| {
+                if let (1, proto::Borrowed::Bytes(key)) = (field, value) {
+                    if !key.is_empty() {
+                        spans.push((key.as_ptr() as usize - base, key.len()));
+                    }
+                }
+                proto::Control::Continue
+            });
+        }
+        proto::Control::Continue
+    });
+    spans
+        .into_iter()
+        .map(|(offset, len)| String::from_utf8_lossy(&message[offset..offset + len]).into_owned())
+        .collect()
+}
+
+fn domain_bytes_match(kind: u32, value: &[u8], query: &[u8]) -> bool {
+    match kind {
+        3 => value == query,
+        2 => suffix_bytes(value, query),
+        0 => !value.is_empty() && contains_bytes(query, value),
+        1 => match (std::str::from_utf8(value), std::str::from_utf8(query)) {
+            (Ok(pattern), Ok(host)) => regex_match(pattern, host),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn suffix_bytes(pattern: &[u8], host: &[u8]) -> bool {
+    if pattern.is_empty() || !host.ends_with(pattern) {
+        return false;
+    }
+    host.len() == pattern.len() || host[host.len() - pattern.len() - 1] == b'.'
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
 }
 
 fn record_site_match(lines: &mut Vec<String>, entry: &GeoSiteEntry, query: &str) {
@@ -513,25 +654,30 @@ fn convert(flags: &Flags) -> Result<(), String> {
 }
 
 fn load_geoip_for_convert(flags: &Flags) -> Result<Vec<GeoIpEntry>, String> {
-    let data = dat::read_file(&flags.input)?;
-    if dat::is_protobuf(&data) {
+    let mapped = load::MappedFile::open(&flags.input)?;
+    if dat::is_protobuf(mapped.bytes()) {
+        drop(mapped);
         selected_geoip(&flags.input, &flags.list)
     } else {
+        drop(mapped);
         dat::text_geoip(&flags.input)
     }
 }
 
 fn load_geosite_for_convert(flags: &Flags) -> Result<Vec<GeoSiteEntry>, String> {
-    let data = dat::read_file(&flags.input)?;
-    if dat::is_protobuf(&data) {
+    let mapped = load::MappedFile::open(&flags.input)?;
+    if dat::is_protobuf(mapped.bytes()) {
+        drop(mapped);
         selected_geosite(&flags.input, &flags.list)
     } else {
+        drop(mapped);
         dat::text_geosite(&flags.input)
     }
 }
 
 fn selected_geosite(path: &str, list: &str) -> Result<Vec<GeoSiteEntry>, String> {
-    let data = dat::read_file(path)?;
+    let mapped = load::MappedFile::open(path)?;
+    let data = mapped.bytes();
     if data.first() == Some(&0) {
         if let Some(entries) = dat::sing_sites(&data) {
             if !entries.is_empty() {

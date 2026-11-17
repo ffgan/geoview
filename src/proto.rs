@@ -76,6 +76,69 @@ pub enum FieldValue {
     Fixed32(u32),
 }
 
+pub enum Borrowed<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+}
+
+pub enum Control {
+    Continue,
+    Break,
+}
+
+/// Walk a protobuf message without copying length-delimited fields.
+pub fn visit<'a>(data: &'a [u8], mut accept: impl FnMut(u32, Borrowed<'a>) -> Control) -> bool {
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(key) = read_varint(data, &mut pos) else {
+            return false;
+        };
+        let field = (key >> 3) as u32;
+        let wire = (key & 7) as u32;
+        if field == 0 {
+            return false;
+        }
+        match wire {
+            0 => {
+                let Some(value) = read_varint(data, &mut pos) else {
+                    return false;
+                };
+                if matches!(accept(field, Borrowed::Varint(value)), Control::Break) {
+                    return true;
+                }
+            }
+            1 => {
+                if pos + 8 > data.len() {
+                    return false;
+                }
+                pos += 8;
+            }
+            2 => {
+                let Some(len) = read_varint(data, &mut pos) else {
+                    return false;
+                };
+                let len = len as usize;
+                if pos + len > data.len() {
+                    return false;
+                }
+                let bytes = &data[pos..pos + len];
+                pos += len;
+                if matches!(accept(field, Borrowed::Bytes(bytes)), Control::Break) {
+                    return true;
+                }
+            }
+            5 => {
+                if pos + 4 > data.len() {
+                    return false;
+                }
+                pos += 4;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub fn parse_message(mut data: &[u8]) -> Option<Vec<Field>> {
     let mut fields = Vec::new();
     while !data.is_empty() {
