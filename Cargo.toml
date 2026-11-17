@@ -1,0 +1,21 @@
+[package]
+name = "geoview"
+version = "0.3.0"
+edition = "2021"
+description = "Drop-in replacement for snowie2000/geoview"
+license = "MIT"
+
+[[bin]]
+name = "geoview"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.0"
+regex = "1.11"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
